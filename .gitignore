@@ -1,0 +1,14 @@
+# Credential material. None of this should ever reach a clone, and the lane
+# writes several of these into a working directory while a job runs.
+*.p12
+*.p8
+*.cer
+*.mobileprovision
+.env
+
+# A filled-in per-app config. The .example is the tracked copy; the real one
+# names a bundle id and belongs to whoever adopted the lane, not to this repo.
+app-config.env
+
+__pycache__/
+*.pyc

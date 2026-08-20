@@ -1,0 +1,595 @@
+# Builds an iOS app and ships it to TestFlight. App-agnostic.
+#
+# COPY THIS FILE VERBATIM. Everything app-specific lives in
+# .github/app-config.env (see .github/app-config.env.example). The only line in
+# here you may need to touch is the push branch below, and only if `ship` is
+# already taken in your repo -- GitHub Actions cannot interpolate anything into
+# an `on:` trigger, so that one value cannot come from the config file.
+#
+# PROVENANCE. This is generalised from the lane this came from, which is the
+# version that actually shipped a build to TestFlight. Almost every comment below
+# records a specific failure that cost a real runner launch; they are kept
+# because the code they guard looks removable without them. What changed for the
+# template is marked "CHANGED FROM THE ORIGINAL".
+#
+# ZERO PER-APP CREDENTIALS. Every secret is an org-level secret that every repo
+# in the org inherits: APPLE_TEAM_ID, APP_STORE_CONNECT_ISSUER_ID,
+# APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_P8_BASE64, DIST_CERT_P12_BASE64,
+# DIST_CERT_PASSWORD, KEYCHAIN_PASSWORD. In particular there is NO
+# PROVISIONING_PROFILE_BASE64 and NO PROVISIONING_PROFILE_NAME: both profiles
+# are minted through the App Store Connect API at build time.
+name: TestFlight
+
+on:
+  # PUSHING THIS BRANCH SHIPS A BUILD TO APPLE. It is named to be unmistakable
+  # and it is not a branch anyone works on -- you push to it only when you mean
+  # it. It also exists because workflow_dispatch only exposes workflows that
+  # live on the DEFAULT branch, so while this lane is on a feature branch it
+  # cannot be dispatched at all.
+  push:
+    branches:
+      - ship/testflight
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this build is going out"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Build and upload
+    # CHANGED FROM THE ORIGINAL: the lane this came from used a per-app runner
+    # label. These are the org runner's labels; a job requesting them lands on
+    # any Mac in the pool.
+    # Self-hosted because GitHub will not start a hosted job on these private
+    # repos.
+    runs-on: [self-hosted, macOS, ios]
+    timeout-minutes: 60
+    # CHANGED FROM THE ORIGINAL: no `environment:`. The lane this came from kept
+    # the signing material in a `testflight` Environment so a feature-branch
+    # workflow could not reach it; the org's secrets are inherited at repo level
+    # instead, and a template that names an Environment fails outright in every
+    # repo that has not created one. If you want the approval gate back, add
+    # `environment: testflight` here and create that Environment in the repo.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # THE ONLY PER-APP INPUT IN THE LANE. Everything downstream reads these
+      # from the environment, so no other step needs to know which app it is
+      # building. Validated here rather than at first use: a missing SCHEME
+      # should stop the job in five seconds, not after the certificate is in the
+      # keychain and a profile is in the owner's Apple account.
+      - name: Load the app configuration
+        run: |
+          config=".github/app-config.env"
+          test -f "$config" || {
+            echo "::error::$config is missing. Copy .github/app-config.env.example to it and fill it in."
+            exit 1; }
+          # A stray CR turns IOS_DIR into "ios\r", which then fails as a missing
+          # directory whose name looks identical to the one that exists.
+          if grep -q $'\r' "$config"; then
+            echo "::error::$config has CRLF line endings; convert it to LF."; exit 1; fi
+
+          set -a
+          # shellcheck disable=SC1090
+          . "$config"
+          set +a
+
+          test -n "${APP_BUNDLE_ID:-}" || { echo "::error::APP_BUNDLE_ID is not set in $config"; exit 1; }
+          IOS_DIR="${IOS_DIR:-ios}"
+          test -d "$IOS_DIR" || { echo "::error::IOS_DIR=$IOS_DIR does not exist in this repo"; exit 1; }
+          FLUTTER="${FLUTTER:-0}"
+          HAS_EXTENSION="${HAS_EXTENSION:-0}"
+
+          # The Flutter project root is the parent of the ios directory:
+          # apps/mobile/ios -> apps/mobile, and ios -> "." at the repo root.
+          APP_DIR="$(dirname "$IOS_DIR")"
+
+          # Deterministic and public, unlike the one in the lane this came from,
+          # which arrived as a secret. Because it is public it can be hardcoded
+          # as PROVISIONING_PROFILE_SPECIFIER in the project file -- see
+          # README.md. Changing it later mints a SECOND profile in the
+          # Apple account rather than renaming the first.
+          APP_PROFILE_NAME="${APP_PROFILE_NAME:-$APP_BUNDLE_ID App Store}"
+          PROFILE_TYPE="${PROFILE_TYPE:-IOS_APP_STORE}"
+
+          # Run-unique by default so two jobs on the same self-hosted Mac cannot
+          # collide, and so nothing here can ever name one of the owner's own
+          # keychains.
+          KEYCHAIN_NAME="${KEYCHAIN_NAME:-ci-${GITHUB_RUN_ID}.keychain}"
+
+          if [ "$HAS_EXTENSION" = "1" ]; then
+            test -n "${EXTENSION_BUNDLE_ID:-}" || {
+              echo "::error::HAS_EXTENSION=1 but EXTENSION_BUNDLE_ID is not set"; exit 1; }
+            test -n "${EXTENSION_PROFILE_NAME:-}" || {
+              echo "::error::HAS_EXTENSION=1 but EXTENSION_PROFILE_NAME is not set"; exit 1; }
+          fi
+
+          if [ "$FLUTTER" = "1" ]; then
+            IPA_DIR="$GITHUB_WORKSPACE/$APP_DIR/build/ios/ipa"
+          else
+            test -n "${SCHEME:-}" || {
+              echo "::error::FLUTTER=0 but SCHEME is not set — xcodebuild cannot archive without one"; exit 1; }
+            IPA_DIR="$RUNNER_TEMP/export"
+          fi
+
+          {
+            echo "APP_BUNDLE_ID=$APP_BUNDLE_ID"
+            echo "IOS_DIR=$IOS_DIR"
+            echo "APP_DIR=$APP_DIR"
+            echo "FLUTTER=$FLUTTER"
+            echo "HAS_EXTENSION=$HAS_EXTENSION"
+            echo "APP_PROFILE_NAME=$APP_PROFILE_NAME"
+            echo "PROFILE_TYPE=$PROFILE_TYPE"
+            echo "KEYCHAIN_NAME=$KEYCHAIN_NAME"
+            echo "EXTENSION_BUNDLE_ID=${EXTENSION_BUNDLE_ID:-}"
+            echo "EXTENSION_PROFILE_NAME=${EXTENSION_PROFILE_NAME:-}"
+            echo "APP_GROUP=${APP_GROUP:-}"
+            echo "EXTENSION_INFO_PLIST=${EXTENSION_INFO_PLIST:-}"
+            echo "EXTENSION_POINT_ID=${EXTENSION_POINT_ID:-}"
+            echo "EXTENSION_PRINCIPAL_CLASS_SUFFIX=${EXTENSION_PRINCIPAL_CLASS_SUFFIX:-}"
+            echo "SCHEME=${SCHEME:-}"
+            echo "XCODE_WORKSPACE=${XCODE_WORKSPACE:-}"
+            echo "XCODE_PROJECT=${XCODE_PROJECT:-}"
+            echo "XCODEBUILD_EXTRA=${XCODEBUILD_EXTRA:-}"
+            echo "FLUTTER_VERSION=${FLUTTER_VERSION:-}"
+            echo "IPA_DIR=$IPA_DIR"
+            echo "EXPORT_OPTIONS_PATH=$GITHUB_WORKSPACE/$IOS_DIR/ExportOptions.plist"
+          } >> "$GITHUB_ENV"
+
+          echo "app        $APP_BUNDLE_ID"
+          echo "profile    $APP_PROFILE_NAME ($PROFILE_TYPE)"
+          echo "ios dir    $IOS_DIR   (app dir $APP_DIR)"
+          echo "flutter    $FLUTTER   extension $HAS_EXTENSION"
+          echo "keychain   $KEYCHAIN_NAME"
+
+      # Never pin an Xcode path: images add and drop versions, and a missing
+      # path fails instantly with a confusing error.
+      # DEVELOPER_DIR rather than `sudo xcode-select`. On a throwaway hosted
+      # runner, changing the machine's global Xcode is harmless. On a
+      # self-hosted Mac it is somebody's actual computer: the change PERSISTS
+      # after the build, and the runner account should not have sudo anyway.
+      # DEVELOPER_DIR scopes the same choice to this process.
+      - name: Select Xcode
+        run: |
+          latest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          test -n "$latest" || { echo "::error::no Xcode found in /Applications"; exit 1; }
+          echo "DEVELOPER_DIR=$latest/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$latest/Contents/Developer" xcodebuild -version
+
+      - name: Read the Flutter version
+        id: tools
+        if: env.FLUTTER == '1'
+        run: |
+          version="${FLUTTER_VERSION:-}"
+          if [ -z "$version" ] && [ -f .mise.toml ]; then
+            version="$(awk -F '"' '/^flutter =/ {print $2}' .mise.toml)"
+          fi
+          echo "flutter=$version" >> "$GITHUB_OUTPUT"
+          echo "flutter version: ${version:-latest stable}"
+
+      - uses: subosito/flutter-action@v2
+        if: env.FLUTTER == '1'
+        with:
+          flutter-version: ${{ steps.tools.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      # Monotonic, and never colliding with a build number already uploaded.
+      # Set the repository variable BUILD_OFFSET if this app already has builds
+      # in App Store Connect above the current run number.
+      - name: Compute the build number
+        id: build
+        run: echo "number=$(( ${{ vars.BUILD_OFFSET || 0 }} + ${{ github.run_number }} ))" >> "$GITHUB_OUTPUT"
+
+      - name: Dependencies
+        run: |
+          if [ "$FLUTTER" = "1" ]; then
+            ( cd "$APP_DIR" && flutter pub get )
+          fi
+          if [ -f "$IOS_DIR/Podfile" ]; then
+            ( cd "$IOS_DIR" && pod install )
+          else
+            echo "no Podfile in $IOS_DIR — skipping pod install"
+          fi
+
+      # A throwaway keychain, deleted in an always() step below whatever happens.
+      - name: Install the signing certificate
+        env:
+          DIST_CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
+          DIST_CERT_PASSWORD: ${{ secrets.DIST_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # THIS FILE IS THE DISTRIBUTION PRIVATE KEY. It was once written to
+          # /tmp with the default umask, which is mode 644 — world-readable —
+          # and removed only on the happy path at the end of this step. The step
+          # runs under `bash -e`, so any failure in the six security commands
+          # below aborts before the rm and LEAVES THE KEY ON THE MACHINE. A
+          # hosted runner destroys its whole VM afterwards, so that never
+          # mattered; a persistent self-hosted Mac does not.
+          #
+          # Now: mode 600 from the moment it exists, inside RUNNER_TEMP which is
+          # job-scoped rather than shared, and removed in the always() cleanup
+          # so a failure cannot strand it.
+          umask 077
+          echo "$DIST_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+          # APPLE'S INTERMEDIATE, AND THIS IS WHAT FOUR RUNS DIED ON.
+          # A freshly created keychain holds ONLY what the .p12 carries — the
+          # leaf and its private key. codesign must build leaf -> WWDR -> Apple
+          # Root, and without the intermediate it fails with:
+          #   "unable to build chain to self-signed root for signer
+          #    Apple Distribution: ..."
+          #   Command CodeSign failed with a nonzero exit code
+          # which is exactly the message the archive produced, visible only
+          # under -v and only in the raw job log.
+          #
+          # The hypothesis was raised, then killed because
+          # `security find-identity -v -p codesigning` reported "1 valid
+          # identity". THAT IS NOT THE SAME VALIDITY. find-identity's notion is
+          # narrower than codesign's chain-to-trusted-root requirement, and
+          # treating one tool's word as the other's cost two runner launches.
+          #
+          # BOTH URLS WERE ONCE HARDCODED WITHOUT BEING CHECKED AND ONE 404'd,
+          # which aborted this step under `bash -e` with a bare "exit code 56"
+          # and cost a launch. The root certificate is at /appleca/, not at
+          # /certificateauthority/. Both are verified reachable, and the two are
+          # treated DIFFERENTLY because they are not equally necessary.
+          #
+          # WWDR IS REQUIRED — it is the missing link that broke four archives,
+          # so its download is fatal on failure and its content is checked to be
+          # a certificate rather than an error page.
+          wwdr="$RUNNER_TEMP/AppleWWDRCAG3.cer"
+          curl -fsSL --retry 3 \
+            https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o "$wwdr"
+          openssl x509 -inform DER -in "$wwdr" -noout -subject \
+            || { echo "::error::downloaded WWDR file is not a certificate"; exit 1; }
+          security import "$wwdr" -k "$KEYCHAIN_NAME" -A
+
+          # THE ROOT IS BEST-EFFORT. macOS already trusts Apple's root, so a
+          # failure here is not fatal — and making it fatal would put a second
+          # network dependency in the credential step for no gain. If the chain
+          # is still incomplete the guard two steps later says so by name.
+          root="$RUNNER_TEMP/AppleIncRootCertificate.cer"
+          curl -fsSL --retry 3 \
+            https://www.apple.com/appleca/AppleIncRootCertificate.cer -o "$root" \
+            && security import "$root" -k "$KEYCHAIN_NAME" -A || true
+
+          # -A, NOT -T. `-T /usr/bin/codesign` creates an ACL naming one binary;
+          # -A imports with no ACL restriction at all. With codesign: already in
+          # the partition list and the keychain unlocked and default, the archive
+          # STILL failed with errSecInternalComponent, and -A is the documented
+          # remedy for the case where the partition list alone does not clear it.
+          #
+          # Acceptable because the blast radius is this job: the keychain is
+          # created here, exists for the length of the build, and is deleted in
+          # the always() cleanup along with the .p12 it came from. -A on a
+          # throwaway keychain is not -A on the owner's login keychain.
+          security import "$RUNNER_TEMP/dist.p12" -k "$KEYCHAIN_NAME" -P "$DIST_CERT_PASSWORD" -A
+
+          # codesign: IS IN THIS LIST BECAUSE ITS ABSENCE IS WHAT ACTUALLY FAILED.
+          # The archive died on `errSecInternalComponent` — codesign could not USE
+          # the private key — not on the chain warning printed above it. A
+          # partition list without codesign: grants apple-tool: and apple: access
+          # and withholds it from the one binary doing the signing.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+          # The DEFAULT keychain, not just the search list. codesign resolves the
+          # identity through the default keychain in a non-interactive session,
+          # and this is somebody's real Mac, so the previous default is saved and
+          # restored in the always() cleanup exactly like the search list.
+          security default-keychain -d user | tr -d ' "' > "$RUNNER_TEMP/default.before"
+          security default-keychain -d user -s "$KEYCHAIN_NAME"
+          # Remember the search list so the cleanup can put it back. On a hosted
+          # runner nobody notices; on a persistent machine, leaving a deleted
+          # keychain in the account's search list is litter that outlives the job.
+          security list-keychain -d user | tr -d ' "' > "$RUNNER_TEMP/keychains.before"
+          security list-keychain -d user -s "$KEYCHAIN_NAME" login.keychain
+          rm -f "$RUNNER_TEMP/dist.p12"
+
+      # Both App Store Connect scripts sign an ES256 JWT. Neither library is on
+      # the macOS runner by default, and a missing one fails at import, after the
+      # certificate is already in the keychain.
+      - name: Install the App Store Connect client dependencies
+        # --user, matching the invocation that PASSED on a self-hosted Mac. A
+        # bare install is not proven broken there, but it is not proven working
+        # either, and the runner account is not an admin.
+        run: python3 -m pip install --quiet --disable-pip-version-check --user pyjwt cryptography
+
+      # BEFORE THE MINT, NOT BEFORE THE ARCHIVE — the difference between a
+      # diagnostic and a guard. The mint at the next step writes provisioning
+      # profiles into the org's APPLE ACCOUNT, and the archive after it is where
+      # signing fails. The mint cannot be moved after the archive (the archive
+      # needs the profiles), so the only lever is to prove the preconditions
+      # FIRST. Placed one step later this would merely explain why an artifact
+      # had been wasted.
+      #
+      # CHANGED FROM THE ORIGINAL: the lane this came from could pass its app
+      # profile here, because that profile arrived as a secret. In this template
+      # BOTH profiles are minted, so nothing exists to cross-check yet and the
+      # script runs in its no-profile mode: valid identity, WWDR intermediate,
+      # and a REAL TEST SIGNATURE. The test signature is the expensive one to
+      # learn late — it is what catches errSecInternalComponent, which otherwise
+      # surfaces twenty minutes into an archive that has already caused a profile
+      # to be created.
+      # The profile/identity cross-check moves to just after the mint.
+      - name: Prove the archive can sign, before anything is minted
+        run: |
+          # PRINTED BEFORE THE PROBE, SO ONE LAUNCH ANSWERS BOTH REMAINING CAUSES
+          # if it fails. Two candidates are left for errSecInternalComponent: the
+          # -T ACL (fixed above, with -A) and the runner not being in a login
+          # session. If -A is the fix these are five harmless lines. If it is
+          # NOT, the very next question is the session one, and asking it costs
+          # another launch of the machine unless the answer is already in the
+          # same log.
+          #
+          # managername reads Aqua in a GUI login session and StandardIO or
+          # Background under `sudo -u other bash -lc`, which IS that cause. This
+          # is read-only and deliberately cannot fail the step — errexit is off
+          # for the block and restored before the guard, which must stay fatal.
+          set +e
+          echo "session context:"
+          echo "  user: $(whoami) (uid $(id -u))"
+          echo "  launchctl managername: $(launchctl managername 2>&1 || echo unavailable)"
+          echo "  launchctl manageruid:  $(launchctl manageruid 2>&1 || echo unavailable)"
+          echo "  SSH_TTY: ${SSH_TTY:-unset}   TERM_SESSION_ID: ${TERM_SESSION_ID:-unset}"
+          security list-keychains -d user
+          security default-keychain -d user
+          set -e
+
+          python3 .github/scripts/check_signing_preconditions.py --keychain "$KEYCHAIN_NAME"
+
+      # THE ONE STEP THAT WRITES TO THE ORG'S APPLE ACCOUNT. It mints or reuses
+      # the app's profile, and the extension's when HAS_EXTENSION=1, installs
+      # both, records their paths for the always() cleanup, and writes
+      # ExportOptions.plist naming both. It never deletes anything, and it dies
+      # on any non-200 rather than reading a failed lookup as "nothing exists" —
+      # which would mint a duplicate.
+      - name: Mint or reuse the provisioning profiles
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_P8_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python3 .github/scripts/ensure_profiles.py
+
+      # THE CROSS-CHECK, NOW AGAINST PROFILES THAT EXIST. It cannot run before
+      # the mint — the profiles do not exist until then — so this NAMES the
+      # failure rather than preventing the artifact. That is the honest limit,
+      # and it is the same limit the lane this came from hit with its extension
+      # profile.
+      - name: The app's profile authorises the same identity
+        run: |
+          python3 .github/scripts/check_signing_preconditions.py \
+            --keychain "$KEYCHAIN_NAME" "$INSTALLED_APP_PROFILE"
+
+      # THE SAME CHECK, AGAINST THE OTHER PROFILE. The lane this came from
+      # checked one profile's certificates and the other profile's entitlements
+      # and never crossed them.
+      # That is what ship attempt 2 hit: the guard passed, the reuse passed, and
+      # the archive still died on a bare "Command CodeSign failed". The appex is
+      # signed with the same keychain identity, so its profile must authorise it
+      # too, and a profile minted against a different certificate does not.
+      - name: The extension's profile authorises the same identity
+        if: env.HAS_EXTENSION == '1'
+        run: |
+          python3 .github/scripts/check_signing_preconditions.py \
+            --keychain "$KEYCHAIN_NAME" "$INSTALLED_EXTENSION_PROFILE"
+
+      # Apple's upload validator is the only reader that checks this, and it runs
+      # at the LAST step of the lane. Asking here costs a second. See
+      # check_extension_point.py for the 90349 rejection this exists for.
+      - name: The extension declares an extension point Apple accepts
+        if: env.HAS_EXTENSION == '1' && env.EXTENSION_INFO_PLIST != ''
+        run: python3 .github/scripts/check_extension_point.py
+
+      # CHANGED FROM THE ORIGINAL: the lane this came from archived through
+      # Flutter only, and ran a repo-specific ruby step before it that
+      # synthesised its Call Directory target into the pbxproj. Neither belongs
+      # in a template — the ruby step is dropped entirely, and the archive
+      # branches on FLUTTER.
+      #
+      # Manual signing must already be configured PER TARGET in the project file.
+      # A global PROVISIONING_PROFILE_SPECIFIER on the xcodebuild command line
+      # applies the distribution profile to CocoaPods dependency targets that "do
+      # not support provisioning profiles" and the archive fails. See
+      # README.md.
+      - name: Archive (Flutter)
+        if: env.FLUTTER == '1'
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # -v BECAUSE FOUR RUNS DIED ON A BARE "Command CodeSign failed with a
+          # nonzero exit code" AND NOTHING ELSE. Flutter swallows xcodebuild's
+          # output on failure, and every hypothesis testable from outside had
+          # been eliminated. The remaining information is inside xcodebuild and
+          # there is no way to it but to ask. Verbose output is noisy and would
+          # not be added speculatively; after four identical failures the noise
+          # is worth strictly less than the one line it will contain. DO NOT
+          # REMOVE IT.
+          flutter build ipa --release -v \
+            --build-number=${{ steps.build.outputs.number }} \
+            --export-options-plist="$EXPORT_OPTIONS_PATH"
+
+      - name: Archive (native xcodebuild)
+        if: env.FLUTTER != '1'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cd "$IOS_DIR"
+
+          # Resolve the container rather than guessing. Ambiguity here produces
+          # an xcodebuild error about a scheme that "does not exist", which sends
+          # people looking at the scheme.
+          if [ -n "${XCODE_WORKSPACE:-}" ]; then
+            container=(-workspace "$XCODE_WORKSPACE")
+          elif [ -n "${XCODE_PROJECT:-}" ]; then
+            container=(-project "$XCODE_PROJECT")
+          else
+            shopt -s nullglob
+            workspaces=(*.xcworkspace)
+            projects=(*.xcodeproj)
+            if [ "${#workspaces[@]}" -eq 1 ]; then
+              container=(-workspace "${workspaces[0]}")
+            elif [ "${#projects[@]}" -eq 1 ]; then
+              container=(-project "${projects[0]}")
+            else
+              echo "::error::cannot pick a container in $IOS_DIR: found ${#workspaces[@]} workspace(s) and ${#projects[@]} project(s). Set XCODE_WORKSPACE or XCODE_PROJECT in .github/app-config.env."
+              exit 1
+            fi
+          fi
+          echo "archiving ${container[*]} scheme $SCHEME"
+
+          archive="$RUNNER_TEMP/app.xcarchive"
+
+          # eval, so a quoted value in XCODEBUILD_EXTRA survives as ONE argument.
+          # Plain word splitting turns CODE_SIGN_IDENTITY="Apple Distribution"
+          # into two arguments and xcodebuild reports a confusing error about
+          # "Distribution". The config file is already sourced by this workflow's
+          # first step, so this is not a new trust boundary.
+          extra=()
+          if [ -n "${XCODEBUILD_EXTRA:-}" ]; then
+            eval "extra=($XCODEBUILD_EXTRA)"
+          fi
+
+          # CURRENT_PROJECT_VERSION is the build number ONLY IF the target's
+          # Info.plist sets CFBundleVersion to $(CURRENT_PROJECT_VERSION), which
+          # is Xcode's default for projects created since Xcode 13 but is NOT
+          # universal. check_bundle_versions.py below reads the number back out
+          # of the built artifact, so a project that ignores this fails there
+          # with the real number printed, not silently.
+          #
+          # NO -allowProvisioningUpdates. That flag lets Xcode create profiles in
+          # the account behind this lane's back, which is the exact thing
+          # ensure_profiles.py is careful about.
+          xcodebuild archive \
+            "${container[@]}" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$archive" \
+            CURRENT_PROJECT_VERSION=${{ steps.build.outputs.number }} \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            "${extra[@]}"
+
+          rm -rf "$IPA_DIR"
+          xcodebuild -exportArchive \
+            -archivePath "$archive" \
+            -exportPath "$IPA_DIR" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PATH"
+
+      # A PRODUCT check, deliberately beside any project-file one rather than
+      # instead of it. The ruby checker in the lane this came from asserted the
+      # version in the PROJECT FILE and was correct every time it ran, while the
+      # file it read was one it had itself rewritten with a 9999 default — the
+      # appex shipped 9999, the app shipped the real number, and Apple rejects
+      # that. An intermediate check verifies a STEP; this verifies the OUTCOME,
+      # and only the second survives someone rearranging the steps.
+      - name: Check the built artifact's versions agree
+        run: |
+          # Unmatched, an unresolved glob passes the literal string and the error
+          # is about a file named "*.ipa"; matched twice it hands the checker two
+          # paths and only the first is read — a check that silently covers half
+          # of what it claims to.
+          shopt -s nullglob
+          ipas=("$IPA_DIR"/*.ipa)
+          test "${#ipas[@]}" -eq 1 || {
+            echo "::error::expected exactly one .ipa in $IPA_DIR, found ${#ipas[@]}: ${ipas[*]:-none}"; exit 1; }
+          expect=""
+          if [ "$HAS_EXTENSION" = "1" ]; then expect="--expect-extension"; fi
+          python3 .github/scripts/check_bundle_versions.py $expect "${ipas[0]}"
+
+      # THE KEY HAS TO BE A FILE. altool's --apiKey takes a key ID, not a key: it
+      # then looks for AuthKey_<id>.p8 on disk. The lane this came from never
+      # wrote it anywhere — the only P8 references were env vars handed to python
+      # scripts, which read the base64 directly — so the upload could not have
+      # worked, and would have failed AFTER signing and archiving, at the last
+      # step, having done all the expensive work first.
+      #
+      # ~/.appstoreconnect/private_keys is the location every altool version
+      # searches. API_PRIVATE_KEYS_DIR would be tidier and keep it inside
+      # RUNNER_TEMP, but whether a given Xcode honours it is untested, and a fix
+      # that depends on an unmeasurable property is the thing to avoid.
+      # It is a real home directory, so it is written 600 and removed in the
+      # always() cleanup, exactly like the p12 and the profiles.
+      - name: Upload to App Store Connect
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_P8_BASE64 }}
+        run: |
+          umask 077
+          keydir=~/.appstoreconnect/private_keys
+          mkdir -p "$keydir"
+          keyfile="$keydir/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          echo "$APP_STORE_CONNECT_P8_BASE64" | base64 --decode > "$keyfile"
+          echo "INSTALLED_ASC_KEY=$keyfile" >> "$GITHUB_ENV"
+
+          # Resolve the glob before passing it. Unmatched, the shell hands the
+          # literal string to altool and the error is about a file named
+          # "*.ipa"; matched twice, altool silently gets an extra argument.
+          shopt -s nullglob
+          ipas=("$IPA_DIR"/*.ipa)
+          test "${#ipas[@]}" -eq 1 || {
+            echo "::error::expected exactly one .ipa in $IPA_DIR, found ${#ipas[@]}: ${ipas[*]:-none}"; exit 1; }
+
+          xcrun altool --upload-app -f "${ipas[0]}" -t ios \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+      # altool saying "upload succeeded" does not mean the build reached a
+      # tester. This polls until it does, and fails if it does not.
+      - name: Verify it became beta-ready
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_P8_BASE64 }}
+          BUILD_NUMBER: ${{ steps.build.outputs.number }}
+        run: python3 .github/scripts/verify_beta_ready.py
+
+      - name: Remove every trace this job left on the machine
+        if: always()
+        run: |
+          # always(), because the failure paths are exactly the ones that strand
+          # things. Each removal is independent and none may abort the others.
+          rm -f "$RUNNER_TEMP/dist.p12"
+          if [ -n "${INSTALLED_ASC_KEY:-}" ]; then
+            rm -f "$INSTALLED_ASC_KEY"
+          fi
+          # The profiles are installed by ensure_profiles.py, not by any run:
+          # block here — which is why an audit of this file's own commands would
+          # never see them. The script reports the exact paths it wrote; only
+          # those paths are removed, never a glob, because this is somebody's
+          # real profile directory.
+          if [ -n "${INSTALLED_APP_PROFILE:-}" ]; then
+            rm -f "$INSTALLED_APP_PROFILE"
+          fi
+          if [ -n "${INSTALLED_EXTENSION_PROFILE:-}" ]; then
+            rm -f "$INSTALLED_EXTENSION_PROFILE"
+          fi
+          if [ -n "${KEYCHAIN_NAME:-}" ]; then
+            security delete-keychain "$KEYCHAIN_NAME" || true
+          fi
+          if [ -s "$RUNNER_TEMP/default.before" ]; then
+            # shellcheck disable=SC2046
+            security default-keychain -d user -s $(cat "$RUNNER_TEMP/default.before") || true
+          fi
+          if [ -s "$RUNNER_TEMP/keychains.before" ]; then
+            # shellcheck disable=SC2046
+            security list-keychain -d user -s $(cat "$RUNNER_TEMP/keychains.before") || true
+          fi
+          security list-keychain -d user
