@@ -544,10 +544,21 @@ def check_project_exists(cfg):
                "check IOS_DIR, or run this from the repository root")
         return
 
+    # A PREBUILD command generates the container at build time (xcodegen,
+    # tuist, a script). If it is set and the container is absent, the honest
+    # report is "will be generated, not verified here" -- a flat FAIL would
+    # contradict the lane, which generates before it archives.
+    has_prebuild = bool(cfg.get("PREBUILD"))
+
     named = cfg.get("XCODE_WORKSPACE") or cfg.get("XCODE_PROJECT")
     if named:
         if os.path.exists(os.path.join(ios_dir, named)):
             record("PROJECT", PASS, f"{ios_dir}/{named} is present")
+        elif has_prebuild:
+            record("PROJECT", SKIP,
+                   f"{ios_dir}/{named} is absent, but PREBUILD is set to "
+                   "generate it - not run here",
+                   "verify PREBUILD produces exactly that container")
         else:
             record("PROJECT", FAIL,
                    f"{ios_dir}/{named} does not exist - xcodebuild has nothing "
@@ -560,6 +571,12 @@ def check_project_exists(cfg):
              if n.endswith((".xcworkspace", ".xcodeproj"))]
     if len(found) == 1:
         record("PROJECT", PASS, f"{ios_dir}/{found[0]} is present")
+    elif not found and has_prebuild:
+        record("PROJECT", SKIP,
+               f"no container in {ios_dir} yet, but PREBUILD is set to generate "
+               "one - not run here",
+               "set XCODE_PROJECT or XCODE_WORKSPACE so the lane knows which "
+               "container PREBUILD produces")
     elif not found:
         record("PROJECT", FAIL,
                f"no .xcodeproj or .xcworkspace in {ios_dir}",
@@ -617,11 +634,20 @@ def check_bundle_version_is_variable(cfg):
 
     if literal:
         shown = "; ".join(f"{p} = {v}" for p, v in literal[:2])
+        # For a generated project, editing Info.plist is undone by the next
+        # generate (gotcha: 'The build number cannot reach a generated
+        # Info.plist you edited by hand'), so point at the source instead.
+        if cfg.get("PREBUILD") or os.path.isfile(os.path.join(ios_dir, "project.yml")):
+            fix = ("this Info.plist is generated - set CFBundleVersion to "
+                   "$(CURRENT_PROJECT_VERSION) in project.yml's info.properties, "
+                   "not in the plist, or the next generate overwrites it")
+        else:
+            fix = "set it to $(CURRENT_PROJECT_VERSION) in the Info.plist"
         record("BUNDLEVER", FAIL,
                f"CFBundleVersion is a literal ({shown}) - the computed build "
                "number will never reach the binary and Apple will reject the "
                "second upload",
-               "set it to $(CURRENT_PROJECT_VERSION) in the Info.plist")
+               fix)
     else:
         record("BUNDLEVER", PASS,
                "CFBundleVersion comes from $(CURRENT_PROJECT_VERSION)")
