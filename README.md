@@ -68,6 +68,23 @@ bundle identifier and nothing else.
 ## Quick check
 
 ```bash
+python3 .github/scripts/preflight.py --repo OWNER/REPO --user <BUILD_USER>
+```
+
+Ten seconds, read-only. It checks the session, the runner (online, standing,
+labelled to match `runs-on`), repository visibility, all seven secrets, the
+bundle identifier, the App Group attachment, the extension point, and whether
+the next build number will be accepted — then prints the fix beside anything
+that failed. It never mutates the machine, the repository or the Apple account.
+
+Whatever it could not check reports `SKIP` with a reason. **A SKIP is not a
+pass.** The signing probe is deliberately one: the identity lives in a keychain
+that exists only while a job runs, so the real key-access check stays in the
+lane where it can run.
+
+Without the lane installed, the single highest-value question is:
+
+```bash
 launchctl managername      # Aqua = can sign.  Background = cannot.
 ```
 

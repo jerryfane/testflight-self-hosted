@@ -69,6 +69,23 @@ developer account at worst.
 ## The fastest thing you can do
 
 ```bash
+python3 .github/scripts/preflight.py --repo OWNER/REPO --user <BUILD_USER>
+```
+
+Ten seconds, read-only, and it asks every question a fifteen-minute build would
+have answered the expensive way: is the session right, is the runner standing and
+labelled to match `runs-on`, is the repository private, are all seven secrets
+present, does the bundle id exist, is the App Group attached, will the build
+number be accepted. It prints the fix beside each failure and changes nothing.
+
+Anything it could not check reports `SKIP` with a reason. **A SKIP is not a
+pass** — that distinction is the whole design, and it is why the signing probe
+deliberately reports SKIP rather than green: the identity lives in a keychain
+that only exists during a job.
+
+If you have not adopted the lane yet, the one question that matters most is:
+
+```bash
 launchctl managername      # Aqua = can sign.  Background = cannot, whatever else is true.
 ```
 
@@ -123,5 +140,10 @@ from was Flutter-only, so that branch is the least-proven code here.
 The *configuration* in `references/` and everything in `gotchas.md` is the
 opposite: all of it was established by shipping a real build, and most of it by
 failing to, repeatedly, first.
+
+`workflow/scripts/preflight.py` is also tested — against a live runner, both
+repo- and organisation-scoped, with negative cases (missing repository, unknown
+build account, no credentials) and with the macOS checks forced off to confirm
+they report `SKIP` rather than passing quietly.
 
 See `## Known issues` in the README.
