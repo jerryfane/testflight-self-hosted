@@ -140,6 +140,7 @@ jobs:
             echo "XCODE_WORKSPACE=${XCODE_WORKSPACE:-}"
             echo "XCODE_PROJECT=${XCODE_PROJECT:-}"
             echo "XCODEBUILD_EXTRA=${XCODEBUILD_EXTRA:-}"
+            echo "PREBUILD=${PREBUILD:-}"
             echo "FLUTTER_VERSION=${FLUTTER_VERSION:-}"
             echo "IPA_DIR=$IPA_DIR"
             echo "EXPORT_OPTIONS_PATH=$GITHUB_WORKSPACE/$IOS_DIR/ExportOptions.plist"
@@ -192,6 +193,15 @@ jobs:
 
       - name: Dependencies
         run: |
+          # PREBUILD runs first because a generated project has to exist before
+          # anything else can look at it. xcodegen and tuist repositories keep
+          # the .xcodeproj out of git, so without this the archive step fails on
+          # a container that was never created -- found the first time this lane
+          # was adopted into a real project.
+          if [ -n "${PREBUILD:-}" ]; then
+            echo "prebuild: $PREBUILD"
+            bash -lc "$PREBUILD"
+          fi
           if [ "$FLUTTER" = "1" ]; then
             ( cd "$APP_DIR" && flutter pub get )
           fi

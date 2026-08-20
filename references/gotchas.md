@@ -219,6 +219,48 @@ account is worse than the bug.
 
 ---
 
+## The build number cannot reach a generated `Info.plist` you edited by hand
+
+**Cost: one cycle, on the first project this lane was ever adopted into.**
+
+The lane computes a monotonic build number and passes it to `xcodebuild` as
+`CURRENT_PROJECT_VERSION`. That only becomes `CFBundleVersion` if the target's
+`Info.plist` asks for it:
+
+```xml
+<key>CFBundleVersion</key>
+<string>$(CURRENT_PROJECT_VERSION)</string>   <!-- indirection: the number arrives -->
+<string>1</string>                            <!-- literal: it never does -->
+```
+
+With a literal, the first upload succeeds and **every later one is rejected for
+not incrementing** — a failure that arrives at the last step of a fifteen-minute
+run and says nothing about `Info.plist`.
+
+The trap underneath it: on an xcodegen or tuist project, `Info.plist` is
+**generated**. Editing it works, the file looks right, and the next `generate`
+silently puts the literal back. The edit has to go where the generator reads it,
+`project.yml`'s `info.properties`, not into the file it emits:
+
+```yaml
+    info:
+      path: MyApp/Info.plist
+      properties:
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+```
+
+Set a default `CURRENT_PROJECT_VERSION` in the target's build settings too, or a
+local Xcode build produces an empty version — CI overrides it on the command
+line, but a developer's machine has nothing to override.
+
+**Edit the source of a generated file, never the file.** Same family as
+mac-build-gate's *a generated `.xcodeproj` survives `git checkout`*: anything
+derived will outlive your change to it, in whichever direction hurts.
+`preflight.py` checks this one before a build exists.
+
+---
+
 ## A capability being enabled is not a group being attached
 
 **Cost: this survived four separate audits of the same function.**

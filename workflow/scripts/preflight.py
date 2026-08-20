@@ -523,6 +523,110 @@ def check_build_number(cfg, repo):
         record("BUILDNUM", PASS, f"last uploaded {last}, next would be {nxt}")
 
 
+def check_project_exists(cfg):
+    """The thing xcodebuild will be pointed at has to be on disk.
+
+    Found by adopting the lane on a real project: an xcodegen repository has no
+    .xcodeproj until something generates it, and the lane's Dependencies step
+    runs pod install and flutter pub get but nothing else. The archive then
+    fails on a container that was never there. Cheap to ask here; twelve minutes
+    into a build otherwise.
+    """
+    if cfg.get("FLUTTER") == "1":
+        record("PROJECT", SKIP, "Flutter build; xcodebuild container not used")
+        return
+    ios_dir = cfg.get("IOS_DIR")
+    if not ios_dir:
+        record("PROJECT", SKIP, "IOS_DIR not in config")
+        return
+    if not os.path.isdir(ios_dir):
+        record("PROJECT", FAIL, f"IOS_DIR '{ios_dir}' does not exist here",
+               "check IOS_DIR, or run this from the repository root")
+        return
+
+    named = cfg.get("XCODE_WORKSPACE") or cfg.get("XCODE_PROJECT")
+    if named:
+        if os.path.exists(os.path.join(ios_dir, named)):
+            record("PROJECT", PASS, f"{ios_dir}/{named} is present")
+        else:
+            record("PROJECT", FAIL,
+                   f"{ios_dir}/{named} does not exist - xcodebuild has nothing "
+                   "to archive",
+                   "if the project is generated (xcodegen, tuist, a script), set "
+                   "PREBUILD in .github/app-config.env so the lane generates it")
+        return
+
+    found = [n for n in os.listdir(ios_dir)
+             if n.endswith((".xcworkspace", ".xcodeproj"))]
+    if len(found) == 1:
+        record("PROJECT", PASS, f"{ios_dir}/{found[0]} is present")
+    elif not found:
+        record("PROJECT", FAIL,
+               f"no .xcodeproj or .xcworkspace in {ios_dir}",
+               "if it is generated, set PREBUILD in .github/app-config.env; "
+               "otherwise set XCODE_PROJECT or XCODE_WORKSPACE")
+    else:
+        record("PROJECT", FAIL,
+               f"{len(found)} containers in {ios_dir}: {', '.join(found)} - "
+               "xcodebuild cannot pick",
+               "set XCODE_WORKSPACE or XCODE_PROJECT in .github/app-config.env")
+
+
+def check_bundle_version_is_variable(cfg):
+    """CFBundleVersion must come from the build setting, not a literal.
+
+    The lane computes a monotonic build number and passes it as
+    CURRENT_PROJECT_VERSION. If Info.plist hardcodes CFBundleVersion instead of
+    referencing $(CURRENT_PROJECT_VERSION), that number never reaches the
+    binary: the first upload succeeds and every later one is rejected for not
+    incrementing. Documented as a known limit; found in the wild on the first
+    project the lane was adopted into.
+    """
+    if cfg.get("FLUTTER") == "1":
+        record("BUNDLEVER", SKIP, "Flutter manages the version itself")
+        return
+    ios_dir = cfg.get("IOS_DIR")
+    if not ios_dir or not os.path.isdir(ios_dir):
+        record("BUNDLEVER", SKIP, "IOS_DIR not available")
+        return
+
+    plists = []
+    for root, dirs, files in os.walk(ios_dir):
+        dirs[:] = [d for d in dirs
+                   if d not in ("Pods", "build", "DerivedData")
+                   and not d.endswith((".xcodeproj", ".xcworkspace"))]
+        plists += [os.path.join(root, f) for f in files if f == "Info.plist"]
+
+    if not plists:
+        record("BUNDLEVER", SKIP, f"no Info.plist found under {ios_dir}")
+        return
+
+    literal = []
+    for path in plists:
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if "CFBundleVersion" not in text:
+            continue
+        after = text.split("CFBundleVersion", 1)[1]
+        value = after.split("<string>", 1)[1].split("</string>", 1)[0] \
+            if "<string>" in after else ""
+        if value and "$(" not in value:
+            literal.append((path, value.strip()))
+
+    if literal:
+        shown = "; ".join(f"{p} = {v}" for p, v in literal[:2])
+        record("BUNDLEVER", FAIL,
+               f"CFBundleVersion is a literal ({shown}) - the computed build "
+               "number will never reach the binary and Apple will reject the "
+               "second upload",
+               "set it to $(CURRENT_PROJECT_VERSION) in the Info.plist")
+    else:
+        record("BUNDLEVER", PASS,
+               "CFBundleVersion comes from $(CURRENT_PROJECT_VERSION)")
+
+
 def check_extension_point(cfg):
     """Offline, and it catches an upload rejection that otherwise arrives after
     signing, minting and archiving have all succeeded."""
@@ -604,6 +708,8 @@ def main():
     check_mac_session(args.user)
     check_xcode()
     check_signing_probe(args.user)
+    check_project_exists(cfg)
+    check_bundle_version_is_variable(cfg)
     check_extension_point(cfg)
     check_apple(cfg)
     check_build_number(cfg, args.repo)
